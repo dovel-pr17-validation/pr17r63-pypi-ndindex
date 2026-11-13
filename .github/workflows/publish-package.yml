@@ -1,0 +1,168 @@
+name: publish distributions
+on:
+  push:
+    branches:
+    - main
+    tags:
+    - '[0-9]+.[0-9]+'
+    - '[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    branches:
+    - main
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        type: choice
+        description: 'Publish to TestPyPI?'
+        options:
+        - false
+        - true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_sdist:
+    name: Build Python distribution
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+
+    - name: Install python-build and twine
+      run: |
+        python -m pip install --upgrade pip setuptools
+        python -m pip install build twine
+        python -m pip list
+
+    - name: Install dependencies
+      run: python -m pip install -r requirements-dev.txt
+
+    - name: Build an sdist
+      run: |
+        PYTHONWARNINGS=error,default::DeprecationWarning python -m build --sdist .
+
+    - name: Verify the distribution
+      run: twine check --strict dist/*
+
+    - name: List contents of sdist
+      run: python -m tarfile --list dist/ndindex-*.tar.gz
+
+    - name: Upload distribution artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: dist-artifact
+        path: dist
+
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [build_sdist]
+    strategy:
+      matrix:
+        # Each runner builds wheels for its native architecture(s)
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          # macos-15-intel is an intel runner, macos-15 is apple silicon
+          - macos-15-intel
+          - macos-15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download distribution artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: dist-artifact
+          path: dist
+
+      - name: Get sdist filename
+        shell: bash
+        # Fail here rather than letting an empty SDIST_FILE make cibuildwheel
+        # silently build from the (shallow, untagged) checkout instead.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          if [ "${#sdists[@]}" -ne 1 ]; then
+            echo "Expected exactly one sdist in dist/, found: ${sdists[*]:-none}" >&2
+            ls -la dist/ >&2 || true
+            exit 1
+          fi
+          echo "SDIST_FILE=${sdists[0]}" >> "$GITHUB_ENV"
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v4.3.4
+        with:
+          package-dir: ${{ env.SDIST_FILE }}
+          output-dir: dist/
+        env:
+          # Versioneer gives "0+untagged..." when it can't find a release tag
+          CIBW_TEST_COMMAND: >
+              python -c "import ndindex; assert not ndindex.__version__.startswith('0+'), ndindex.__version__"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ./dist/*.whl
+
+  publish:
+    name: Publish Python distribution to (Test)PyPI
+    if: github.event_name != 'pull_request' && github.repository == 'Quansight-Labs/ndindex'
+    needs: [build_sdist, build_wheels]
+    runs-on: ubuntu-latest
+    # Mandatory for publishing with a trusted publisher
+    # c.f. https://docs.pypi.org/trusted-publishers/using-a-publisher/
+    permissions:
+      id-token: write
+      contents: write
+    # Restrict to the environment set for the trusted publisher
+    environment:
+      name: publish-package
+
+    steps:
+    - name: Download distribution artifact
+      uses: actions/download-artifact@v8
+      with:
+        path: dist
+        merge-multiple: true
+
+    - name: List all files
+      run: ls -lh dist
+
+    - name: Publish distribution 📦 to Test PyPI
+      # Publish to TestPyPI if manually triggered.
+      # Note that this step was disabled on release tag events due to
+      # https://github.com/pypa/gh-action-pypi-publish/issues/283 (see gh-205).
+      #
+      # Compare to 'true' string as booleans get turned into strings in the console
+      if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'
+      uses: pypa/gh-action-pypi-publish@v1.14.3
+      with:
+        repository-url: https://test.pypi.org/legacy/
+        print-hash: true
+
+    - name: Create GitHub Release from a Tag
+      uses: softprops/action-gh-release@v3.0.3
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+          files: dist/*
+
+    - name: Publish distribution 📦 to PyPI
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
+      uses: pypa/gh-action-pypi-publish@v1.14.3
+      with:
+        print-hash: true
